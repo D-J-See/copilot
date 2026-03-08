@@ -150,6 +150,103 @@ class ToolRegistry:
         return sorted(self._tools.keys())
 
 
+# ── Resource Registry ─────────────────────────────────────────────────────────
+
+
+class ResourceRegistry:
+    """Central registry for MCP resources."""
+
+    def __init__(self) -> None:
+        self._resources: Dict[str, Dict[str, Any]] = {}
+        self._handlers: Dict[str, Callable] = {}
+
+    def register(
+        self,
+        name: Optional[str] = None,
+        description: str = "",
+        mime_type: str = "text/plain",
+    ) -> Callable:
+        """Decorator that registers a function as an MCP resource.
+
+        The function should return a string (resource contents).
+
+        Example usage in tools/*.py::
+
+            def register_resources(resources):
+                @resources.register(
+                    name="packages/versions",
+                    description="JSON list of packages with tracked versions",
+                    mime_type="application/json"
+                )
+                def get_package_versions() -> str:
+                    return json.dumps([...])
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            resource_name = name or fn.__name__
+            self._resources[resource_name] = {
+                "uri": f"resource://{resource_name}",
+                "name": resource_name,
+                "description": description or (fn.__doc__ or "").strip(),
+                "mimeType": mime_type,
+            }
+            self._handlers[resource_name] = fn
+            log.debug("Registered resource: %s", resource_name)
+            return fn
+
+        return decorator
+
+    def discover(self, directory: str) -> int:
+        """Scan *directory* for Python modules and call register_resources().
+
+        Each module should expose::
+
+            def register_resources(registry: ResourceRegistry) -> None: ...
+
+        Returns the number of new resources registered.
+        """
+        before = len(self._resources)
+        if not os.path.isdir(directory):
+            return 0
+
+        for filename in sorted(os.listdir(directory)):
+            if not filename.endswith(".py") or filename.startswith("_"):
+                continue
+            filepath = os.path.join(directory, filename)
+            module_name = f"_mcp_resource_{filename[:-3]}"
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, filepath
+                )
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = mod
+                spec.loader.exec_module(mod)
+                if callable(getattr(mod, "register_resources", None)):
+                    mod.register_resources(self)
+                    log.debug("Loaded resource module: %s", filename)
+            except Exception as exc:
+                log.error("Failed to load resources from %s: %s", filename, exc)
+
+        discovered = len(self._resources) - before
+        if discovered > 0:
+            log.info(
+                "Auto-discovery: %d new resource(s) from %s", discovered, directory
+            )
+        return discovered
+
+    def list_resources(self) -> List[Dict]:
+        return list(self._resources.values())
+
+    def read_resource(self, name: str) -> str:
+        if name not in self._handlers:
+            raise ValueError(f"Unknown resource: {name!r}")
+        return self._handlers[name]()
+
+    @property
+    def resource_names(self) -> List[str]:
+        return sorted(self._resources.keys())
+
+
 # ── Schema inference ──────────────────────────────────────────────────────────
 
 _PY_TO_JSON: Dict[type, str] = {
@@ -232,7 +329,7 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "mcp-server", "version": "1.0.0"}
 SERVER_CAPABILITIES = {
     "tools": {"listChanged": True},
-    "resources": {},
+    "resources": {"listChanged": True},
     "prompts": {},
 }
 
@@ -240,7 +337,9 @@ SERVER_CAPABILITIES = {
 # ── Request dispatcher ────────────────────────────────────────────────────────
 
 
-def dispatch(msg: Dict, tool_reg: ToolRegistry) -> Optional[str]:
+def dispatch(
+    msg: Dict, tool_reg: ToolRegistry, resource_reg: ResourceRegistry
+) -> Optional[str]:
     """Handle one JSON-RPC message; return serialised response or None."""
     method = msg.get("method", "")
     req_id = msg.get("id")
@@ -284,9 +383,33 @@ def dispatch(msg: Dict, tool_reg: ToolRegistry) -> Optional[str]:
                     },
                 )
         if method == "resources/list":
-            return _ok(req_id, {"resources": []})
+            return _ok(req_id, {"resources": resource_reg.list_resources()})
         if method == "resources/read":
-            return _err(req_id, -32601, "resources/read not implemented")
+            resource_name = params.get("uri", "").replace("resource://", "")
+            try:
+                content = resource_reg.read_resource(resource_name)
+                return _ok(
+                    req_id,
+                    {
+                        "contents": [
+                            {
+                                "uri": f"resource://{resource_name}",
+                                "mimeType": next(
+                                    (
+                                        r["mimeType"]
+                                        for r in resource_reg.list_resources()
+                                        if r["name"] == resource_name
+                                    ),
+                                    "text/plain",
+                                ),
+                                "text": content,
+                            }
+                        ]
+                    },
+                )
+            except Exception as exc:
+                log.warning("Resource %r read failed: %s", resource_name, exc)
+                return _err(req_id, -32602, f"Resource error: {exc}")
         if method == "prompts/list":
             return _ok(req_id, {"prompts": []})
         if method == "prompts/get":
@@ -319,6 +442,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
     """
 
     tool_registry: ToolRegistry = None
+    resource_registry: ResourceRegistry = None
     base_url: str = ""
 
     def log_message(self, fmt, *args):
@@ -375,7 +499,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
 
         log.debug("JSON-RPC  method=%s", msg.get("method"))
-        response = dispatch(msg, self.tool_registry)
+        response = dispatch(msg, self.tool_registry, self.resource_registry)
 
         if response is not None:
             resp_bytes = response.encode()
@@ -446,7 +570,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": f"invalid JSON: {exc}"})
             return
-        response = dispatch(msg, self.tool_registry)
+        response = dispatch(msg, self.tool_registry, self.resource_registry)
         if response is not None:
             q.put(response)
         self.send_response(202)
@@ -529,17 +653,19 @@ def _register_builtin_tools(reg: ToolRegistry) -> None:
 
 
 def make_server(
-    host: str, port: int, tool_reg: ToolRegistry
+    host: str, port: int, tool_reg: ToolRegistry, resource_reg: ResourceRegistry
 ) -> http.server.HTTPServer:
     class _Handler(MCPHandler):
         pass
 
     _Handler.tool_registry = tool_reg
+    _Handler.resource_registry = resource_reg
     _Handler.base_url = f"http://{host}:{port}"
     return http.server.ThreadingHTTPServer((host, port), _Handler)
 
 
 registry = ToolRegistry()
+resource_registry = ResourceRegistry()
 
 
 def main() -> None:
@@ -564,18 +690,21 @@ def main() -> None:
 
     _register_builtin_tools(registry)
     registry.discover(args.tools_dir)
+    resource_registry.discover(args.tools_dir)
 
     log.info(
-        "MCP server  http://%s:%s  (%d tools)",
+        "MCP server  http://%s:%s  (%d tools, %d resources)",
         args.host,
         args.port,
         len(registry.list_tools()),
+        len(resource_registry.list_resources()),
     )
-    log.info("Tools:   %s", registry.tool_names)
+    log.info("Tools:     %s", registry.tool_names)
+    log.info("Resources: %s", resource_registry.resource_names)
     log.info("SSE:     http://%s:%s/sse", args.host, args.port)
     log.info("Health:  http://%s:%s/health", args.host, args.port)
 
-    server = make_server(args.host, args.port, registry)
+    server = make_server(args.host, args.port, registry, resource_registry)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
